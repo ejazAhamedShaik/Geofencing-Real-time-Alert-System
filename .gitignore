@@ -3,3 +3,4 @@ node_modules
 dist/
 apps/api/dist/
 *.tsbuildinfo
+.env.docker
