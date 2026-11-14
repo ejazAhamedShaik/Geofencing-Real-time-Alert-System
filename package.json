@@ -1,0 +1,16 @@
+{
+  "name": "geofencing-alert-system",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/api", "apps/web", "packages/contracts"],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm run dev -w @geofence/api\" \"npm run dev -w @geofence/web\"",
+    "build": "npm run build -w @geofence/contracts && npm run build -w @geofence/api && npm run build -w @geofence/web",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  }
+}
