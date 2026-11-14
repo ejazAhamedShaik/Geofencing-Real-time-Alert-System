@@ -1,9 +1,10 @@
-import 'dotenv/config';
+import "dotenv/config";
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { Pool } from "pg";
 import { alertRoutes } from "./routes/alerts.js";
 import { geofenceRoutes } from "./routes/geofences.js";
+import { historyRoutes } from "./routes/history.js";
 import { vehicleRoutes } from "./routes/vehicles.js";
 import { AlertHub } from "./services/alertHub.js";
 
@@ -43,13 +44,16 @@ const alertHub = new AlertHub();
 alertHub.startHeartbeats();
 const requestStartTimes = new WeakMap<object, bigint>();
 
-app.addHook('onRequest', async (request) => {
+app.addHook("onRequest", async (request) => {
   requestStartTimes.set(request, process.hrtime.bigint());
 });
 
-app.addHook('onSend', async (request, reply, payload) => {
-  const contentType = String(reply.getHeader('content-type') ?? '');
-  if (typeof payload !== 'string' || !contentType.includes('application/json')) {
+app.addHook("onSend", async (request, reply, payload) => {
+  const contentType = String(reply.getHeader("content-type") ?? "");
+  if (
+    typeof payload !== "string" ||
+    !contentType.includes("application/json")
+  ) {
     return payload;
   }
 
@@ -60,7 +64,7 @@ app.addHook('onSend', async (request, reply, payload) => {
 
   try {
     const body: unknown = JSON.parse(payload);
-    if (typeof body === 'object' && body !== null && !Array.isArray(body)) {
+    if (typeof body === "object" && body !== null && !Array.isArray(body)) {
       return JSON.stringify({
         ...body,
         time_ns: (process.hrtime.bigint() - startedAt).toString(),
@@ -74,31 +78,36 @@ app.addHook('onSend', async (request, reply, payload) => {
 });
 
 app.setErrorHandler((error, request, reply) => {
-  request.log.error({ err: error }, 'Request failed');
+  request.log.error({ err: error }, "Request failed");
   const errorStatusCode =
-    typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
+    typeof error === "object" &&
+    error !== null &&
+    "statusCode" in error &&
+    typeof error.statusCode === "number"
       ? error.statusCode
       : 500;
-  const errorMessage = error instanceof Error ? error.message : 'Request failed.';
+  const errorMessage =
+    error instanceof Error ? error.message : "Request failed.";
 
   if (errorStatusCode >= 400 && errorStatusCode < 500) {
     return reply.code(errorStatusCode).send({
       statusCode: errorStatusCode,
-      error: 'Bad Request',
+      error: "Bad Request",
       message: errorMessage,
     });
   }
 
   return reply.code(500).send({
     statusCode: 500,
-    error: 'Internal Server Error',
-    message: 'An unexpected error occurred.',
+    error: "Internal Server Error",
+    message: "An unexpected error occurred.",
   });
 });
 
 await app.register(websocket);
 await app.register(alertRoutes(pool, alertHub));
 await app.register(geofenceRoutes(pool));
+await app.register(historyRoutes(pool));
 await app.register(vehicleRoutes(pool, alertHub));
 app.get("/health", async () => ({ status: "ok" }));
 app.get("/test-postgis", async () => {
