@@ -1,7 +1,11 @@
-import type { FastifyPluginAsync, FastifyReply } from 'fastify';
-import type { Pool } from 'pg';
-import { ulid } from 'ulid';
-import { createVehicleSchema, vehicleIdParamsSchema } from '../schemas/vehicle.js';
+import type { FastifyPluginAsync, FastifyReply } from "fastify";
+import type { Pool } from "pg";
+import { ulid } from "ulid";
+import {
+  createVehicleSchema,
+  updateVehicleLocationSchema,
+  vehicleIdParamsSchema,
+} from "../schemas/vehicle.js";
 
 type VehicleRow = {
   id: string;
@@ -19,24 +23,48 @@ type VehicleLocationRow = {
   latitude: number | null;
   longitude: number | null;
   recorded_at: Date | null;
-  current_geofences: Array<{ geofence_id: string; geofence_name: string; category: string }>;
+  current_geofences: Array<{
+    geofence_id: string;
+    geofence_name: string;
+    category: string;
+  }>;
 };
 
-function sendValidationError(reply: FastifyReply, issues: Array<{ path: PropertyKey[]; message: string }>) {
+type CurrentGeofenceRow = {
+  geofence_id: string;
+  geofence_name: string;
+};
+
+type PreviousMembershipRow = {
+  geofence_id: string;
+};
+
+function sendValidationError(
+  reply: FastifyReply,
+  issues: Array<{ path: PropertyKey[]; message: string }>,
+) {
   return reply.code(400).send({
-    error: 'Validation Error',
-    message: 'The request contains invalid vehicle data.',
-    details: issues.map((issue) => ({ field: issue.path.map(String).join('.'), message: issue.message })),
+    error: "Validation Error",
+    message: "The request contains invalid vehicle data.",
+    details: issues.map((issue) => ({
+      field: issue.path.map(String).join("."),
+      message: issue.message,
+    })),
   });
 }
 
 function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505';
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "23505"
+  );
 }
 
 export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
   return async (app) => {
-    app.post('/vehicles', async (request, reply) => {
+    app.post("/vehicles", async (request, reply) => {
       const parsed = createVehicleSchema.safeParse(request.body);
       if (!parsed.success) {
         return sendValidationError(reply, parsed.error.issues);
@@ -46,19 +74,30 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
       const id = `veh_${ulid()}`;
 
       try {
-        const result = await pool.query<{ id: string; vehicle_number: string; status: string }>(
+        const result = await pool.query<{
+          id: string;
+          vehicle_number: string;
+          status: string;
+        }>(
           `INSERT INTO vehicles (id, vehicle_number, driver_name, vehicle_type, phone)
            VALUES ($1, $2, $3, $4, $5)
            RETURNING id, vehicle_number, status`,
-          [id, vehicle.vehicle_number, vehicle.driver_name, vehicle.vehicle_type, vehicle.phone],
+          [
+            id,
+            vehicle.vehicle_number,
+            vehicle.driver_name,
+            vehicle.vehicle_type,
+            vehicle.phone,
+          ],
         );
 
         return reply.code(201).send(result.rows[0]);
       } catch (error) {
         if (isUniqueViolation(error)) {
           return reply.code(409).send({
-            error: 'Conflict',
-            message: 'A vehicle with this vehicle_number is already registered.',
+            error: "Conflict",
+            message:
+              "A vehicle with this vehicle_number is already registered.",
           });
         }
 
@@ -66,7 +105,7 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
       }
     });
 
-    app.get('/vehicles', async () => {
+    app.get("/vehicles", async () => {
       const result = await pool.query<VehicleRow>(
         `SELECT id, vehicle_number, driver_name, vehicle_type, phone, status, created_at
          FROM vehicles
@@ -76,7 +115,180 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
       return { vehicles: result.rows };
     });
 
-    app.get('/vehicles/location/:vehicle_id', async (request, reply) => {
+    app.post("/vehicles/location", async (request, reply) => {
+      const parsed = updateVehicleLocationSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return sendValidationError(reply, parsed.error.issues);
+      }
+
+      const {
+        vehicle_id: vehicleId,
+        latitude,
+        longitude,
+        timestamp,
+      } = parsed.data;
+      const client = await pool.connect();
+      let transactionOpen = false;
+
+      try {
+        await client.query("BEGIN");
+        transactionOpen = true;
+
+        const vehicleResult = await client.query<{ id: string }>(
+          "SELECT id FROM vehicles WHERE id = $1 FOR UPDATE",
+          [vehicleId],
+        );
+
+        if (!vehicleResult.rowCount) {
+          await client.query("ROLLBACK");
+          transactionOpen = false;
+          return reply
+            .code(404)
+            .send({ error: "Not Found", message: "Vehicle was not found." });
+        }
+
+        const previousLocation = await client.query<{ recorded_at: Date }>(
+          `SELECT recorded_at
+           FROM vehicle_locations
+           WHERE vehicle_id = $1
+           ORDER BY recorded_at DESC, id DESC
+           LIMIT 1`,
+          [vehicleId],
+        );
+
+        if (
+          previousLocation.rows[0] &&
+          new Date(timestamp) < previousLocation.rows[0].recorded_at
+        ) {
+          await client.query("ROLLBACK");
+          transactionOpen = false;
+          return reply.code(409).send({
+            error: "Conflict",
+            message:
+              "The location timestamp is older than the latest location already recorded for this vehicle.",
+          });
+        }
+
+        await client.query(
+          `INSERT INTO vehicle_locations (vehicle_id, position, recorded_at)
+           VALUES (
+             $1,
+             ST_SetSRID(ST_MakePoint($2, $3), 4326)::geometry(Point, 4326),
+             $4
+           )`,
+          [vehicleId, longitude, latitude, timestamp],
+        );
+
+        const currentResult = await client.query<CurrentGeofenceRow>(
+          `SELECT id AS geofence_id, name AS geofence_name
+           FROM geofences
+           WHERE status = 'active'
+             AND ST_Covers(
+               boundary,
+               ST_SetSRID(ST_MakePoint($1, $2), 4326)::geometry(Point, 4326)
+             )
+           ORDER BY name, id`,
+          [longitude, latitude],
+        );
+
+        const previousMembershipResult =
+          await client.query<PreviousMembershipRow>(
+            `SELECT geofence_id
+           FROM vehicle_geofence_state
+           WHERE vehicle_id = $1 AND is_inside = true
+           FOR UPDATE`,
+            [vehicleId],
+          );
+
+        const currentIds = new Set(
+          currentResult.rows.map((row) => row.geofence_id),
+        );
+        const previousIds = new Set(
+          previousMembershipResult.rows.map((row) => row.geofence_id),
+        );
+        const entered = currentResult.rows.filter(
+          (row) => !previousIds.has(row.geofence_id),
+        );
+        const exited = previousMembershipResult.rows.filter(
+          (row) => !currentIds.has(row.geofence_id),
+        );
+
+        for (const geofence of entered) {
+          await client.query(
+            `INSERT INTO geofence_events (id, vehicle_id, geofence_id, event_type, position, occurred_at)
+             VALUES (
+               $1, $2, $3, 'entry',
+               ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry(Point, 4326),
+               $6
+             )`,
+            [
+              `viol_${ulid()}`,
+              vehicleId,
+              geofence.geofence_id,
+              longitude,
+              latitude,
+              timestamp,
+            ],
+          );
+
+          await client.query(
+            `INSERT INTO vehicle_geofence_state (vehicle_id, geofence_id, is_inside, last_changed_at)
+             VALUES ($1, $2, true, $3)
+             ON CONFLICT (vehicle_id, geofence_id)
+             DO UPDATE SET is_inside = true, last_changed_at = EXCLUDED.last_changed_at`,
+            [vehicleId, geofence.geofence_id, timestamp],
+          );
+        }
+
+        for (const geofence of exited) {
+          await client.query(
+            `INSERT INTO geofence_events (id, vehicle_id, geofence_id, event_type, position, occurred_at)
+             VALUES (
+               $1, $2, $3, 'exit',
+               ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry(Point, 4326),
+               $6
+             )`,
+            [
+              `viol_${ulid()}`,
+              vehicleId,
+              geofence.geofence_id,
+              longitude,
+              latitude,
+              timestamp,
+            ],
+          );
+
+          await client.query(
+            `UPDATE vehicle_geofence_state
+             SET is_inside = false, last_changed_at = $3
+             WHERE vehicle_id = $1 AND geofence_id = $2`,
+            [vehicleId, geofence.geofence_id, timestamp],
+          );
+        }
+
+        await client.query("COMMIT");
+        transactionOpen = false;
+
+        return {
+          vehicle_id: vehicleId,
+          location_updated: true,
+          current_geofences: currentResult.rows.map((geofence) => ({
+            geofence_id: geofence.geofence_id,
+            geofence_name: geofence.geofence_name,
+            status: "inside" as const,
+          })),
+        };
+      } catch (error) {
+        if (transactionOpen) {
+          await client.query("ROLLBACK");
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
+
+    app.get("/vehicles/location/:vehicle_id", async (request, reply) => {
       const parsed = vehicleIdParamsSchema.safeParse(request.params);
       if (!parsed.success) {
         return sendValidationError(reply, parsed.error.issues);
@@ -124,7 +336,9 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
 
       const vehicle = result.rows[0];
       if (!vehicle) {
-        return reply.code(404).send({ error: 'Not Found', message: 'Vehicle was not found.' });
+        return reply
+          .code(404)
+          .send({ error: "Not Found", message: "Vehicle was not found." });
       }
 
       return {
