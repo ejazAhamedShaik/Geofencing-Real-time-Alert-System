@@ -37,6 +37,8 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+    # Compose runs migrations once in the migrate service before starting API.
+    command: ["node", "apps/api/dist/server.js"]
     environment:
       NODE_ENV: production
       PORT: 3000

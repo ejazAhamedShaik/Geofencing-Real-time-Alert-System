@@ -31,4 +31,4 @@ COPY --from=build /app/packages/contracts/package.json ./packages/contracts/pack
 COPY --from=build /app/packages/contracts/src ./packages/contracts/src
 
 EXPOSE 3000
-CMD ["node", "apps/api/dist/server.js"]
+CMD ["sh", "-c", "node apps/api/dist/db/migrate.js up && exec node apps/api/dist/server.js"]
