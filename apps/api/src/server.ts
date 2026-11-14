@@ -3,6 +3,7 @@ import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { Pool } from "pg";
 import { geofenceRoutes } from "./routes/geofences.js";
+import { vehicleRoutes } from "./routes/vehicles.js";
 
 const pool = new Pool({
   //   user: process.env.POSTGRES_USER,
@@ -93,6 +94,7 @@ app.setErrorHandler((error, request, reply) => {
 
 await app.register(websocket);
 await app.register(geofenceRoutes(pool));
+await app.register(vehicleRoutes(pool));
 app.get("/health", async () => ({ status: "ok" }));
 app.get("/test-postgis", async () => {
   const result = await testConnection();
