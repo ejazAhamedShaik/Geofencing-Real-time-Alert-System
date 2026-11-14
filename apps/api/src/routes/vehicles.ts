@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync, FastifyReply } from "fastify";
 import type { Pool } from "pg";
 import { ulid } from "ulid";
+import type { AlertMessage, GeofenceCategory } from "@geofence/contracts";
+import { AlertHub } from "../services/alertHub.js";
 import {
   createVehicleSchema,
   updateVehicleLocationSchema,
@@ -33,10 +35,13 @@ type VehicleLocationRow = {
 type CurrentGeofenceRow = {
   geofence_id: string;
   geofence_name: string;
+  category: GeofenceCategory;
 };
 
 type PreviousMembershipRow = {
   geofence_id: string;
+  geofence_name: string;
+  category: GeofenceCategory;
 };
 
 function sendValidationError(
@@ -62,7 +67,7 @@ function isUniqueViolation(error: unknown): boolean {
   );
 }
 
-export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
+export function vehicleRoutes(pool: Pool, alertHub: AlertHub): FastifyPluginAsync {
   return async (app) => {
     app.post("/vehicles", async (request, reply) => {
       const parsed = createVehicleSchema.safeParse(request.body);
@@ -134,8 +139,12 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
         await client.query("BEGIN");
         transactionOpen = true;
 
-        const vehicleResult = await client.query<{ id: string }>(
-          "SELECT id FROM vehicles WHERE id = $1 FOR UPDATE",
+        const vehicleResult = await client.query<{
+          id: string;
+          vehicle_number: string;
+          driver_name: string;
+        }>(
+          "SELECT id, vehicle_number, driver_name FROM vehicles WHERE id = $1 FOR UPDATE",
           [vehicleId],
         );
 
@@ -146,6 +155,7 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
             .code(404)
             .send({ error: "Not Found", message: "Vehicle was not found." });
         }
+        const vehicle = vehicleResult.rows[0]!;
 
         const previousLocation = await client.query<{ recorded_at: Date }>(
           `SELECT recorded_at
@@ -180,7 +190,7 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
         );
 
         const currentResult = await client.query<CurrentGeofenceRow>(
-          `SELECT id AS geofence_id, name AS geofence_name
+          `SELECT id AS geofence_id, name AS geofence_name, category
            FROM geofences
            WHERE status = 'active'
              AND ST_Covers(
@@ -193,10 +203,11 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
 
         const previousMembershipResult =
           await client.query<PreviousMembershipRow>(
-            `SELECT geofence_id
-           FROM vehicle_geofence_state
-           WHERE vehicle_id = $1 AND is_inside = true
-           FOR UPDATE`,
+            `SELECT state.geofence_id, geofence.name AS geofence_name, geofence.category
+             FROM vehicle_geofence_state AS state
+             JOIN geofences AS geofence ON geofence.id = state.geofence_id
+             WHERE state.vehicle_id = $1 AND state.is_inside = true
+             FOR UPDATE OF state`,
             [vehicleId],
           );
 
@@ -213,61 +224,87 @@ export function vehicleRoutes(pool: Pool): FastifyPluginAsync {
           (row) => !currentIds.has(row.geofence_id),
         );
 
-        for (const geofence of entered) {
+        const transitions = [
+          ...entered.map((geofence) => ({ ...geofence, event_type: "entry" as const })),
+          ...exited.map((geofence) => ({ ...geofence, event_type: "exit" as const })),
+        ];
+        const alertsToBroadcast: AlertMessage[] = [];
+
+        for (const transition of transitions) {
+          const eventId = `evt_${ulid()}`;
           await client.query(
             `INSERT INTO geofence_events (id, vehicle_id, geofence_id, event_type, position, occurred_at)
              VALUES (
-               $1, $2, $3, 'entry',
-               ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry(Point, 4326),
-               $6
+               $1, $2, $3, $4,
+               ST_SetSRID(ST_MakePoint($5, $6), 4326)::geometry(Point, 4326),
+               $7
              )`,
             [
-              `viol_${ulid()}`,
+              eventId,
               vehicleId,
-              geofence.geofence_id,
+              transition.geofence_id,
+              transition.event_type,
               longitude,
               latitude,
               timestamp,
             ],
           );
 
-          await client.query(
-            `INSERT INTO vehicle_geofence_state (vehicle_id, geofence_id, is_inside, last_changed_at)
-             VALUES ($1, $2, true, $3)
-             ON CONFLICT (vehicle_id, geofence_id)
-             DO UPDATE SET is_inside = true, last_changed_at = EXCLUDED.last_changed_at`,
-            [vehicleId, geofence.geofence_id, timestamp],
-          );
-        }
+          if (transition.event_type === "entry") {
+            await client.query(
+              `INSERT INTO vehicle_geofence_state (vehicle_id, geofence_id, is_inside, last_changed_at)
+               VALUES ($1, $2, true, $3)
+               ON CONFLICT (vehicle_id, geofence_id)
+               DO UPDATE SET is_inside = true, last_changed_at = EXCLUDED.last_changed_at`,
+              [vehicleId, transition.geofence_id, timestamp],
+            );
+          } else {
+            await client.query(
+              `UPDATE vehicle_geofence_state
+               SET is_inside = false, last_changed_at = $3
+               WHERE vehicle_id = $1 AND geofence_id = $2`,
+              [vehicleId, transition.geofence_id, timestamp],
+            );
+          }
 
-        for (const geofence of exited) {
-          await client.query(
-            `INSERT INTO geofence_events (id, vehicle_id, geofence_id, event_type, position, occurred_at)
-             VALUES (
-               $1, $2, $3, 'exit',
-               ST_SetSRID(ST_MakePoint($4, $5), 4326)::geometry(Point, 4326),
-               $6
-             )`,
-            [
-              `viol_${ulid()}`,
-              vehicleId,
-              geofence.geofence_id,
-              longitude,
-              latitude,
-              timestamp,
-            ],
+          const matchingRule = await client.query<{ should_alert: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1
+               FROM alert_rules
+               WHERE geofence_id = $1
+                 AND status = 'active'
+                 AND (vehicle_id IS NULL OR vehicle_id = $2)
+                 AND (event_type = $3 OR event_type = 'both')
+             ) AS should_alert`,
+            [transition.geofence_id, vehicleId, transition.event_type],
           );
 
-          await client.query(
-            `UPDATE vehicle_geofence_state
-             SET is_inside = false, last_changed_at = $3
-             WHERE vehicle_id = $1 AND geofence_id = $2`,
-            [vehicleId, geofence.geofence_id, timestamp],
-          );
+          if (matchingRule.rows[0]?.should_alert) {
+            alertsToBroadcast.push({
+              event_id: eventId,
+              event_type: transition.event_type,
+              timestamp: new Date(timestamp).toISOString(),
+              vehicle: {
+                vehicle_id: vehicle.id,
+                vehicle_number: vehicle.vehicle_number,
+                driver_name: vehicle.driver_name,
+              },
+              geofence: {
+                geofence_id: transition.geofence_id,
+                geofence_name: transition.geofence_name,
+                category: transition.category,
+              },
+              location: { latitude, longitude },
+            });
+          }
         }
 
         await client.query("COMMIT");
         transactionOpen = false;
+
+        for (const alert of alertsToBroadcast) {
+          setImmediate(() => alertHub.broadcast(alert));
+        }
 
         return {
           vehicle_id: vehicleId,

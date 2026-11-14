@@ -2,8 +2,10 @@ import 'dotenv/config';
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { Pool } from "pg";
+import { alertRoutes } from "./routes/alerts.js";
 import { geofenceRoutes } from "./routes/geofences.js";
 import { vehicleRoutes } from "./routes/vehicles.js";
+import { AlertHub } from "./services/alertHub.js";
 
 const pool = new Pool({
   //   user: process.env.POSTGRES_USER,
@@ -37,6 +39,8 @@ const testConnection = async () => {
 };
 
 const app = Fastify({ logger: true });
+const alertHub = new AlertHub();
+alertHub.startHeartbeats();
 const requestStartTimes = new WeakMap<object, bigint>();
 
 app.addHook('onRequest', async (request) => {
@@ -93,8 +97,9 @@ app.setErrorHandler((error, request, reply) => {
 });
 
 await app.register(websocket);
+await app.register(alertRoutes(pool, alertHub));
 await app.register(geofenceRoutes(pool));
-await app.register(vehicleRoutes(pool));
+await app.register(vehicleRoutes(pool, alertHub));
 app.get("/health", async () => ({ status: "ok" }));
 app.get("/test-postgis", async () => {
   const result = await testConnection();
