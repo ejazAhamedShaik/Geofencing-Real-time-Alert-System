@@ -9,12 +9,18 @@ if (!databaseUrl) {
 }
 
 const migrationsDirectory = fileURLToPath(new URL('../../migrations', import.meta.url));
+const requestedDirection = process.argv[2] ?? 'up';
+
+if (requestedDirection !== 'up' && requestedDirection !== 'down') {
+  throw new Error('Migration direction must be "up" or "down".');
+}
 
 await runner({
   databaseUrl,
   dir: migrationsDirectory,
   migrationsTable: 'schema_migrations',
-  direction: 'up',
+  direction: requestedDirection,
+  ...(requestedDirection === 'down' ? { count: 1 } : {}),
   checkOrder: true,
   singleTransaction: true,
   verbose: true,

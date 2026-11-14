@@ -2,11 +2,14 @@ import "dotenv/config";
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
 import { Pool } from "pg";
-
 const pool = new Pool({
+  //   user: process.env.POSTGRES_USER,
+  //   host: process.env.POSTGRES_HOST,
+  //   database: process.env.POSTGRES_DB,
+  //   password: process.env.POSTGRES_PASSWORD,
+  //   port: Number(process.env.POSTGRES_PORT ?? 5432),
   connectionString: process.env.DATABASE_URL,
 });
-
 const testConnection = async () => {
   try {
     const response = await pool.query("SELECT postGIS_Full_version();");
@@ -25,7 +28,6 @@ const testConnection = async () => {
     throw error;
   }
 };
-
 const app = Fastify({ logger: true });
 await app.register(websocket);
 app.get("/health", async () => ({ status: "ok" }));
@@ -33,6 +35,5 @@ app.get("/test-postgis", async () => {
   const result = await testConnection();
   return result;
 });
-
 const port = Number(process.env.PORT ?? 3000);
 await app.listen({ port, host: "0.0.0.0" });
