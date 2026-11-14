@@ -1,5 +1,6 @@
 import "dotenv/config";
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import { Pool } from "pg";
 import { alertRoutes } from "./routes/alerts.js";
@@ -104,6 +105,11 @@ app.setErrorHandler((error, request, reply) => {
   });
 });
 
+const webOrigins = (process.env.WEB_ORIGIN ?? "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+await app.register(cors, { origin: webOrigins });
 await app.register(websocket);
 await app.register(alertRoutes(pool, alertHub));
 await app.register(geofenceRoutes(pool));

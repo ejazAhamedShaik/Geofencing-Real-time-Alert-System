@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@fastify/cors": "^11.4.3",
     "@fastify/websocket": "^11.2.0",
     "@geofence/contracts": "*",
     "dotenv": "^18.0.10",
